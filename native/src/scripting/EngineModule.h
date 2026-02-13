@@ -1,21 +1,23 @@
 #pragma once
-
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
-// NOTE: Python.h must be included early in any TU that uses the CPython C-API.
-#include <Python.h>
+namespace input { struct InputState; }
+
+namespace scripting {
 
 struct EngineContext {
   HWND hwnd = nullptr;
+  input::InputState* input = nullptr;
+  bool* requestQuit = nullptr;
 };
 
-namespace EngineModule {
-  // Provide the module with access to host-side data (window handle etc.)
-  void SetContext(EngineContext* ctx);
+/// Registers the built-in Python module named "engine".
+/// Must be called BEFORE Py_Initialize(), via PyImport_AppendInittab.
+bool RegisterEngineModule();
 
-  // Register the built-in module "engine" with the embedded interpreter.
-  // Must be called BEFORE Py_Initialize().
-  bool Register();
-}
+/// Provide runtime context (HWND, input, quit flag) used by engine.* functions.
+void SetEngineContext(const EngineContext& ctx);
+
+} // namespace scripting

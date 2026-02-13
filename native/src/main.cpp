@@ -1,6 +1,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <windowsx.h>
 
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan.h>
@@ -14,38 +15,56 @@
 
 #include "scripting/PythonHost.h"
 #include "scripting/EngineModule.h"
+#include "input/InputState.h"
 
 static const char* kAppName = "BSP Engine Host";
 static bool g_framebufferResized = false;
-static PythonHost* g_py = nullptr; // used by WndProc to forward events
+
+static input::InputState g_input{};
+static bool g_requestQuit = false;
+static scripting::PythonHost* g_pyHost = nullptr;
 
 // --------------------- logging ---------------------
 static void logi(const char* msg) { std::printf("[INFO] %s\n", msg); }
 static void loge(const char* msg) { std::printf("[ERR ] %s\n", msg); }
 
-static std::string get_exe_dir() {
-  char path[MAX_PATH] = {};
-  DWORD len = GetModuleFileNameA(nullptr, path, MAX_PATH);
-  if (len == 0 || len >= MAX_PATH) return std::string(".");
-  std::string s(path, path + len);
-  size_t pos = s.find_last_of("\\/");
-  if (pos == std::string::npos) return std::string(".");
-  return s.substr(0, pos);
-}
-
 // --------------------- Win32 window ---------------------
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
-    case WM_SIZE:
+    case WM_SIZE: {
       g_framebufferResized = true;
-      if (g_py) {
-        int w = LOWORD(lParam);
-        int h = HIWORD(lParam);
-        g_py->call_event("resize", w, h);
-      }
+      int w = LOWORD(lParam);
+      int h = HIWORD(lParam);
+      if (g_pyHost) g_pyHost->callEvent("resize", w, h, 0);
       return 0;
-    case WM_DESTROY:
-      if (g_py) g_py->call_event("quit", 0, 0);
+    }
+    
+case WM_KEYDOWN:
+case WM_SYSKEYDOWN: {
+  int vk = (int)wParam;
+  g_input.setKeyDown(vk, true);
+  return 0;
+}
+case WM_KEYUP:
+case WM_SYSKEYUP: {
+  int vk = (int)wParam;
+  g_input.setKeyDown(vk, false);
+  return 0;
+}
+case WM_MOUSEMOVE: {
+  int x = GET_X_LPARAM(lParam);
+  int y = GET_Y_LPARAM(lParam);
+  g_input.setMousePos(x, y);
+  return 0;
+}
+case WM_LBUTTONDOWN: g_input.setMouseButtonDown(0, true); return 0;
+case WM_LBUTTONUP:   g_input.setMouseButtonDown(0, false); return 0;
+case WM_RBUTTONDOWN: g_input.setMouseButtonDown(1, true); return 0;
+case WM_RBUTTONUP:   g_input.setMouseButtonDown(1, false); return 0;
+case WM_MBUTTONDOWN: g_input.setMouseButtonDown(2, true); return 0;
+case WM_MBUTTONUP:   g_input.setMouseButtonDown(2, false); return 0;
+
+case WM_DESTROY:
       PostQuitMessage(0);
       return 0;
     default:
@@ -82,6 +101,24 @@ static HWND create_window(HINSTANCE hInstance, int width, int height) {
   }
 
   ShowWindow(hwnd, SW_SHOW);
+
+// --------------------- Python scripting (embedded) ---------------------
+scripting::PythonHost py{};
+g_pyHost = &py;
+scripting::EngineContext ectx{};
+ectx.hwnd = hwnd;
+ectx.input = &g_input;
+ectx.requestQuit = &g_requestQuit;
+scripting::SetEngineContext(ectx);
+
+// Assumes you set PYTHONPATH to include the project's /python folder.
+// Example in PowerShell: $env:PYTHONPATH="$PSScriptRoot\python"
+if (!py.init("game")) {
+  loge("Python init failed (module 'game' not found?)");
+} else {
+  py.callEvent("start", 0, 0, 0);
+}
+
   return hwnd;
 }
 
@@ -175,31 +212,6 @@ int main() {
   HWND hwnd = create_window(hInstance, 1280, 720);
   if (!hwnd) return 1;
   logi("Window created.");
-
-// ---- Host context for Python bindings ----
-EngineContext engCtx{};
-engCtx.hwnd = hwnd;
-EngineModule::SetContext(&engCtx);
-
-
-  // ---- Python (gameplay scripts) ----
-  // We deliberately keep this minimal: the renderer stays in C++/Vulkan,
-  // while gameplay logic can immediately live in Python.
-  PythonHost py;
-  g_py = &py;
-  {
-    PythonHostConfig cfg;
-    // project layout: native/../python
-    cfg.scriptsDir = get_exe_dir() + "\\..\\python";
-    cfg.moduleName = "game";
-
-    if (!py.init(cfg)) {
-      std::printf("[PYERR] Failed to init Python: %s\n", py.last_error().c_str());
-    } else {
-      py.call_init();
-      py.call_event("start", 0, 0);
-    }
-  }
 
   // ---- Instance ----
   bool enableValidation = has_layer("VK_LAYER_KHRONOS_validation");
@@ -728,23 +740,29 @@ EngineModule::SetContext(&engCtx);
   MSG msg{};
   bool running = true;
 
-  LARGE_INTEGER freq{};
-  LARGE_INTEGER last{};
-  QueryPerformanceFrequency(&freq);
-  QueryPerformanceCounter(&last);
+  LARGE_INTEGER qpf{};
+  LARGE_INTEGER qpcPrev{};
+  QueryPerformanceFrequency(&qpf);
+  QueryPerformanceCounter(&qpcPrev);
 
   while (running) {
-    LARGE_INTEGER now{};
-    QueryPerformanceCounter(&now);
-    float dt = (float)((double)(now.QuadPart - last.QuadPart) / (double)freq.QuadPart);
-    last = now;
-    if (py.ok()) py.call_update(dt);
-
     while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) running = false;
       TranslateMessage(&msg);
       DispatchMessage(&msg);
     }
+    if (!running) break;
+
+    // ---- per-frame input + dt ----
+    g_input.beginFrame();
+    LARGE_INTEGER qpcNow{};
+    QueryPerformanceCounter(&qpcNow);
+    double dt = 0.0;
+    if (qpf.QuadPart > 0) dt = (double)(qpcNow.QuadPart - qpcPrev.QuadPart) / (double)qpf.QuadPart;
+    qpcPrev = qpcNow;
+
+    if (g_requestQuit) running = false;
+    if (running && g_pyHost) g_pyHost->callUpdate(dt);
     if (!running) break;
 
     vkcheck(vkWaitForFences(device, 1, &inFlight[frameIndex], VK_TRUE, UINT64_MAX),
@@ -817,11 +835,6 @@ EngineModule::SetContext(&engCtx);
   vkDestroySurfaceKHR(instance, surface, nullptr);
   if (dbg) destroy_debug_messenger(instance, dbg);
   vkDestroyInstance(instance, nullptr);
-
-  if (py.ok()) {
-    py.call_event("shutdown", 0, 0);
-  }
-  g_py = nullptr;
 
   logi("Shutdown clean.");
   return 0;

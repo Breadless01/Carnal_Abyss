@@ -1,16 +1,19 @@
-#include "scripting/EngineModule.h"
+#include "EngineModule.h"
+#include "../input/InputState.h"
+
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
 
 #include <cstdio>
-#include <string>
-#include <chrono>
+#include <cstring>
 
-static EngineContext* g_ctx = nullptr;
+namespace scripting {
 
-void EngineModule::SetContext(EngineContext* ctx) {
-  g_ctx = ctx;
-}
+static EngineContext g_ctx{};
 
-// ----------------------- helpers -----------------------
+void SetEngineContext(const EngineContext& ctx) { g_ctx = ctx; }
+
+// ------------------- helpers -------------------
 static PyObject* py_log(PyObject*, PyObject* args) {
   const char* msg = nullptr;
   if (!PyArg_ParseTuple(args, "s", &msg)) return nullptr;
@@ -21,76 +24,93 @@ static PyObject* py_log(PyObject*, PyObject* args) {
 static PyObject* py_set_window_title(PyObject*, PyObject* args) {
   const char* title = nullptr;
   if (!PyArg_ParseTuple(args, "s", &title)) return nullptr;
-
-  if (!g_ctx || !g_ctx->hwnd) {
-    PyErr_SetString(PyExc_RuntimeError, "engine.set_window_title: host window not ready");
-    return nullptr;
+  if (g_ctx.hwnd && title) {
+    SetWindowTextA(g_ctx.hwnd, title);
   }
-
-  SetWindowTextA(g_ctx->hwnd, title ? title : "");
   Py_RETURN_NONE;
 }
 
-static PyObject* py_get_window_size(PyObject*, PyObject* /*args*/) {
-  if (!g_ctx || !g_ctx->hwnd) {
-    PyErr_SetString(PyExc_RuntimeError, "engine.get_window_size: host window not ready");
-    return nullptr;
-  }
+static PyObject* py_get_window_size(PyObject*, PyObject*) {
+  if (!g_ctx.hwnd) return Py_BuildValue("(ii)", 0, 0);
   RECT r{};
-  GetClientRect(g_ctx->hwnd, &r);
-  int w = (int)(r.right - r.left);
-  int h = (int)(r.bottom - r.top);
+  GetClientRect(g_ctx.hwnd, &r);
+  int w = (r.right - r.left);
+  int h = (r.bottom - r.top);
   return Py_BuildValue("(ii)", w, h);
 }
 
-static PyObject* py_time_seconds(PyObject*, PyObject* /*args*/) {
-  // Monotonic-ish clock for simple scripting
-  static LARGE_INTEGER freq{};
-  static LARGE_INTEGER start{};
-  static bool inited = false;
-  if (!inited) {
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
-    inited = true;
-  }
-  LARGE_INTEGER now{};
+static PyObject* py_time_seconds(PyObject*, PyObject*) {
+  // Python can call time.time() too; this is just convenient + stable.
+  LARGE_INTEGER freq{}, now{};
+  QueryPerformanceFrequency(&freq);
   QueryPerformanceCounter(&now);
-  double t = double(now.QuadPart - start.QuadPart) / double(freq.QuadPart);
-  return PyFloat_FromDouble(t);
+  double sec = (freq.QuadPart > 0) ? (double)now.QuadPart / (double)freq.QuadPart : 0.0;
+  return PyFloat_FromDouble(sec);
 }
 
-static PyObject* py_request_quit(PyObject*, PyObject* /*args*/) {
-  PostQuitMessage(0);
+static PyObject* py_request_quit(PyObject*, PyObject*) {
+  if (g_ctx.requestQuit) *g_ctx.requestQuit = true;
   Py_RETURN_NONE;
 }
 
-// ----------------------- module def -----------------------
-static PyMethodDef kEngineMethods[] = {
-  {"log", py_log, METH_VARARGS, "Log a message via the host."},
-  {"set_window_title", py_set_window_title, METH_VARARGS, "Set the host window title."},
-  {"get_window_size", py_get_window_size, METH_NOARGS, "Return (width,height) of the client area."},
-  {"time_seconds", py_time_seconds, METH_NOARGS, "Return a monotonic time in seconds since host start."},
-  {"request_quit", py_request_quit, METH_NOARGS, "Ask the host to quit (posts WM_QUIT)."},
+// --------- input ----------
+static PyObject* py_is_key_down(PyObject*, PyObject* args) {
+  int vk = 0;
+  if (!PyArg_ParseTuple(args, "i", &vk)) return nullptr;
+  if (!g_ctx.input) Py_RETURN_FALSE;
+  bool down = g_ctx.input->isKeyDown(vk);
+  if (down) Py_RETURN_TRUE;
+  Py_RETURN_FALSE;
+}
+
+static PyObject* py_mouse_pos(PyObject*, PyObject*) {
+  if (!g_ctx.input) return Py_BuildValue("(ii)", 0, 0);
+  return Py_BuildValue("(ii)", g_ctx.input->mouseX, g_ctx.input->mouseY);
+}
+
+static PyObject* py_mouse_delta(PyObject*, PyObject*) {
+  if (!g_ctx.input) return Py_BuildValue("(ii)", 0, 0);
+  return Py_BuildValue("(ii)", g_ctx.input->mouseDX, g_ctx.input->mouseDY);
+}
+
+static PyObject* py_mouse_button_down(PyObject*, PyObject* args) {
+  int button = 0; // 0=L,1=R,2=M
+  if (!PyArg_ParseTuple(args, "i", &button)) return nullptr;
+  if (!g_ctx.input) Py_RETURN_FALSE;
+  bool down = g_ctx.input->isMouseDown(button);
+  if (down) Py_RETURN_TRUE;
+  Py_RETURN_FALSE;
+}
+
+static PyMethodDef kMethods[] = {
+  {"log", py_log, METH_VARARGS, "engine.log(str) -> None"},
+  {"set_window_title", py_set_window_title, METH_VARARGS, "engine.set_window_title(str) -> None"},
+  {"get_window_size", py_get_window_size, METH_NOARGS, "engine.get_window_size() -> (w,h)"},
+  {"time_seconds", py_time_seconds, METH_NOARGS, "engine.time_seconds() -> float"},
+  {"request_quit", py_request_quit, METH_NOARGS, "engine.request_quit() -> None"},
+
+  {"is_key_down", py_is_key_down, METH_VARARGS, "engine.is_key_down(vk:int) -> bool"},
+  {"mouse_pos", py_mouse_pos, METH_NOARGS, "engine.mouse_pos() -> (x,y)"},
+  {"mouse_delta", py_mouse_delta, METH_NOARGS, "engine.mouse_delta() -> (dx,dy)"},
+  {"mouse_button_down", py_mouse_button_down, METH_VARARGS, "engine.mouse_button_down(btn:int) -> bool"},
   {nullptr, nullptr, 0, nullptr}
 };
 
-static struct PyModuleDef kEngineModule = {
+static struct PyModuleDef kModule = {
   PyModuleDef_HEAD_INIT,
   "engine",
-  "Carnal Abyss host engine bindings (minimal).",
+  "Minimal built-in engine API (embedded).",
   -1,
-  kEngineMethods
+  kMethods
 };
 
-PyMODINIT_FUNC PyInit_engine(void) {
-  return PyModule_Create(&kEngineModule);
+static PyObject* PyInit_engine() {
+  return PyModule_Create(&kModule);
 }
 
-bool EngineModule::Register() {
-  // Add a built-in module named "engine". Call before Py_Initialize().
-  // If it was already added, CPython returns 0 as success anyway.
-  if (PyImport_AppendInittab("engine", &PyInit_engine) != 0) {
-    return false;
-  }
-  return true;
+bool RegisterEngineModule() {
+  // Must happen before Py_Initialize()
+  return PyImport_AppendInittab("engine", &PyInit_engine) == 0;
 }
+
+} // namespace scripting
