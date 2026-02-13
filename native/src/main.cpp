@@ -12,20 +12,40 @@
 #include <algorithm>
 #include <fstream>
 
+#include "scripting/PythonHost.h"
+#include "scripting/EngineModule.h"
+
 static const char* kAppName = "BSP Engine Host";
 static bool g_framebufferResized = false;
+static PythonHost* g_py = nullptr; // used by WndProc to forward events
 
 // --------------------- logging ---------------------
 static void logi(const char* msg) { std::printf("[INFO] %s\n", msg); }
 static void loge(const char* msg) { std::printf("[ERR ] %s\n", msg); }
+
+static std::string get_exe_dir() {
+  char path[MAX_PATH] = {};
+  DWORD len = GetModuleFileNameA(nullptr, path, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH) return std::string(".");
+  std::string s(path, path + len);
+  size_t pos = s.find_last_of("\\/");
+  if (pos == std::string::npos) return std::string(".");
+  return s.substr(0, pos);
+}
 
 // --------------------- Win32 window ---------------------
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
   switch (msg) {
     case WM_SIZE:
       g_framebufferResized = true;
+      if (g_py) {
+        int w = LOWORD(lParam);
+        int h = HIWORD(lParam);
+        g_py->call_event("resize", w, h);
+      }
       return 0;
     case WM_DESTROY:
+      if (g_py) g_py->call_event("quit", 0, 0);
       PostQuitMessage(0);
       return 0;
     default:
@@ -155,6 +175,31 @@ int main() {
   HWND hwnd = create_window(hInstance, 1280, 720);
   if (!hwnd) return 1;
   logi("Window created.");
+
+// ---- Host context for Python bindings ----
+EngineContext engCtx{};
+engCtx.hwnd = hwnd;
+EngineModule::SetContext(&engCtx);
+
+
+  // ---- Python (gameplay scripts) ----
+  // We deliberately keep this minimal: the renderer stays in C++/Vulkan,
+  // while gameplay logic can immediately live in Python.
+  PythonHost py;
+  g_py = &py;
+  {
+    PythonHostConfig cfg;
+    // project layout: native/../python
+    cfg.scriptsDir = get_exe_dir() + "\\..\\python";
+    cfg.moduleName = "game";
+
+    if (!py.init(cfg)) {
+      std::printf("[PYERR] Failed to init Python: %s\n", py.last_error().c_str());
+    } else {
+      py.call_init();
+      py.call_event("start", 0, 0);
+    }
+  }
 
   // ---- Instance ----
   bool enableValidation = has_layer("VK_LAYER_KHRONOS_validation");
@@ -683,7 +728,18 @@ int main() {
   MSG msg{};
   bool running = true;
 
+  LARGE_INTEGER freq{};
+  LARGE_INTEGER last{};
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&last);
+
   while (running) {
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    float dt = (float)((double)(now.QuadPart - last.QuadPart) / (double)freq.QuadPart);
+    last = now;
+    if (py.ok()) py.call_update(dt);
+
     while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
       if (msg.message == WM_QUIT) running = false;
       TranslateMessage(&msg);
@@ -761,6 +817,11 @@ int main() {
   vkDestroySurfaceKHR(instance, surface, nullptr);
   if (dbg) destroy_debug_messenger(instance, dbg);
   vkDestroyInstance(instance, nullptr);
+
+  if (py.ok()) {
+    py.call_event("shutdown", 0, 0);
+  }
+  g_py = nullptr;
 
   logi("Shutdown clean.");
   return 0;
