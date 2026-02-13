@@ -25,6 +25,41 @@ static bool g_requestQuit = false;
 static scripting::PythonHost* g_pyHost = nullptr;
 static scripting::PythonHost g_py{};
 
+// --------------------- Working directory fix ---------------------
+static bool file_exists(const std::string& p) {
+  DWORD a = GetFileAttributesA(p.c_str());
+  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+static std::string parent_dir(std::string p) {
+  while (!p.empty() && (p.back() == '\\' || p.back() == '/')) p.pop_back();
+  for (size_t i = p.size(); i > 0; --i) {
+    char c = p[i - 1];
+    if (c == '\\' || c == '/') {
+      p.resize(i - 1);
+      break;
+    }
+  }
+  return p;
+}
+
+static void set_working_dir_to_project_root() {
+  char exePath[MAX_PATH]{};
+  DWORD n = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return;
+
+  std::string dir = parent_dir(std::string(exePath));
+  for (int i = 0; i < 6 && !dir.empty(); ++i) {
+    std::string shaderProbe = dir + "\\shaders\\triangle.vert.spv";
+    if (file_exists(shaderProbe)) {
+      SetCurrentDirectoryA(dir.c_str());
+      std::printf("[INFO] CWD set to project root: %s\n", dir.c_str());
+      return;
+    }
+    dir = parent_dir(dir);
+  }
+}
+
 // --------------------- logging ---------------------
 static void logi(const char* msg) { std::printf("[INFO] %s\n", msg); }
 static void loge(const char* msg) { std::printf("[ERR ] %s\n", msg); }
@@ -192,6 +227,9 @@ static VkShaderModule create_shader_module(VkDevice device, const char* path) {
 int main() {
   HINSTANCE hInstance = GetModuleHandle(nullptr);
   logi("Starting host...");
+
+  // Ensure relative paths like shaders/* work regardless of where the exe is started from.
+  set_working_dir_to_project_root();
 
   HWND hwnd = create_window(hInstance, 1280, 720);
   if (!hwnd) return 1;
