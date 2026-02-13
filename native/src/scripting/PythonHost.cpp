@@ -5,6 +5,69 @@
 #include <Python.h>
 
 #include <cstdio>
+#include <string>
+#include <vector>
+
+#if defined(_WIN32)
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
+static void AddSysPathFront(const char* path) {
+  if (!path || !path[0]) return;
+  PyObject* sysPath = PySys_GetObject("path"); // borrowed
+  if (!sysPath || !PyList_Check(sysPath)) return;
+  PyObject* p = PyUnicode_FromString(path);
+  if (!p) return;
+  PyList_Insert(sysPath, 0, p);
+  Py_DECREF(p);
+}
+
+#if defined(_WIN32)
+static bool IsDir(const std::string& p) {
+  DWORD attrs = GetFileAttributesA(p.c_str());
+  if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+  return (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+static std::string DirName(std::string p) {
+  for (size_t i = p.size(); i > 0; --i) {
+    char c = p[i - 1];
+    if (c == '\\' || c == '/') {
+      p.resize(i - 1);
+      break;
+    }
+  }
+  return p;
+}
+
+static void AddProjectPythonCandidatesToSysPath() {
+  char exePath[MAX_PATH]{};
+  DWORD n = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return;
+
+  std::string exeDir = DirName(std::string(exePath));
+
+  // Typical layouts:
+  // - <repo>/build/Release/Game.exe  -> <repo>/python
+  // - <repo>/build/Debug/Game.exe    -> <repo>/python
+  // - running from repo root         -> <repo>/python already in CWD
+  std::vector<std::string> candidates = {
+    exeDir + "\\python",
+    exeDir + "\\..\\python",
+    exeDir + "\\..\\..\\python",
+    exeDir + "\\..\\..\\..\\python",
+  };
+
+  for (const auto& c : candidates) {
+    if (IsDir(c)) {
+      AddSysPathFront(c.c_str());
+      return; // first match is enough
+    }
+  }
+}
+#endif
 
 namespace scripting {
 
@@ -20,6 +83,7 @@ void PythonHost::clearCached() {
 }
 
 bool PythonHost::init(const std::string& gameModuleName) {
+
   if (m_initialized) return true;
 
   if (!RegisterEngineModule()) {
@@ -33,6 +97,10 @@ bool PythonHost::init(const std::string& gameModuleName) {
     return false;
   }
 
+#if defined(_WIN32)
+  AddProjectPythonCandidatesToSysPath();
+#endif
+
   m_moduleName = gameModuleName;
 
   PyObject* name = PyUnicode_FromString(m_moduleName.c_str());
@@ -41,6 +109,13 @@ bool PythonHost::init(const std::string& gameModuleName) {
 
   if (!module) {
     PyErr_Print();
+    PyObject* sysPath = PySys_GetObject("path"); // borrowed
+    if (sysPath) {
+      PyObject* r = PyObject_Repr(sysPath);
+      const char* s = r ? PyUnicode_AsUTF8(r) : nullptr;
+      std::printf("[PY] sys.path=%s\n", s ? s : "<unavailable>");
+      Py_XDECREF(r);
+    }
     std::printf("[PY] Failed to import module '%s'\n", m_moduleName.c_str());
     return false;
   }

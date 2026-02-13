@@ -21,3 +21,7 @@ bool RegisterEngineModule();
 void SetEngineContext(const EngineContext& ctx);
 
 } // namespace scripting
+
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>
+extern "C" PyMODINIT_FUNC PyInit_engine(void);

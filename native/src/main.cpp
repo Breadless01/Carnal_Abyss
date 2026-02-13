@@ -23,6 +23,7 @@ static bool g_framebufferResized = false;
 static input::InputState g_input{};
 static bool g_requestQuit = false;
 static scripting::PythonHost* g_pyHost = nullptr;
+static scripting::PythonHost g_py{};
 
 // --------------------- logging ---------------------
 static void logi(const char* msg) { std::printf("[INFO] %s\n", msg); }
@@ -101,23 +102,6 @@ static HWND create_window(HINSTANCE hInstance, int width, int height) {
   }
 
   ShowWindow(hwnd, SW_SHOW);
-
-// --------------------- Python scripting (embedded) ---------------------
-scripting::PythonHost py{};
-g_pyHost = &py;
-scripting::EngineContext ectx{};
-ectx.hwnd = hwnd;
-ectx.input = &g_input;
-ectx.requestQuit = &g_requestQuit;
-scripting::SetEngineContext(ectx);
-
-// Assumes you set PYTHONPATH to include the project's /python folder.
-// Example in PowerShell: $env:PYTHONPATH="$PSScriptRoot\python"
-if (!py.init("game")) {
-  loge("Python init failed (module 'game' not found?)");
-} else {
-  py.callEvent("start", 0, 0, 0);
-}
 
   return hwnd;
 }
@@ -212,6 +196,22 @@ int main() {
   HWND hwnd = create_window(hInstance, 1280, 720);
   if (!hwnd) return 1;
   logi("Window created.");
+
+  // --------------------- Python scripting (embedded) ---------------------
+  g_pyHost = &g_py;
+  scripting::EngineContext ectx{};
+  ectx.hwnd = hwnd;
+  ectx.input = &g_input;
+  ectx.requestQuit = &g_requestQuit;
+  scripting::SetEngineContext(ectx);
+
+  // Assumes you set PYTHONPATH to include the project's /python folder.
+  // Example in PowerShell: $env:PYTHONPATH="$PSScriptRoot\python"
+  if (!g_py.init("game")) {
+    loge("Python init failed (module 'game' not found?)");
+  } else {
+    g_py.callEvent("start", 0, 0, 0);
+  }
 
   // ---- Instance ----
   bool enableValidation = has_layer("VK_LAYER_KHRONOS_validation");
@@ -822,6 +822,11 @@ int main() {
 
   // ---- Cleanup ----
   vkDeviceWaitIdle(device);
+
+  if (g_pyHost) {
+    g_pyHost->shutdown();
+    g_pyHost = nullptr;
+  }
 
   cleanup_swapchain_deps();
   destroy_pipeline();

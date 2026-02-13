@@ -104,7 +104,7 @@ static struct PyModuleDef kModule = {
   kMethods
 };
 
-static PyObject* PyInit_engine() {
+extern "C" PyMODINIT_FUNC PyInit_engine(void) {
   return PyModule_Create(&kModule);
 }
 
